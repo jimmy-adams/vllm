@@ -271,6 +271,16 @@ class Platform:
                 f"{cls.device_name}."
             ) from e
 
+    # GPU device IDs can refer to three distinct namespaces:
+    # - logical: vLLM-local IDs such as local ranks. These index
+    #   assigned_physical_gpu_ids when it is set.
+    # - visible: torch/CUDA ordinals in the current process after applying
+    #   the device-control env var, e.g. CUDA_VISIBLE_DEVICES.
+    # - physical: global GPU IDs used by topology and management APIs such as
+    #   NVML, which are not remapped by CUDA_VISIBLE_DEVICES.
+    # Keep conversions explicit. In particular, torch device indices are
+    # visible IDs, not vLLM logical IDs.
+
     @classmethod
     def device_id_to_physical_device_id(cls, device_id: int):
         """Map a vLLM-local logical device ID to a physical device ID.
@@ -411,7 +421,12 @@ class Platform:
         cls,
         device_id: int = 0,
     ) -> DeviceCapability | None:
-        """Stateless version of [torch.cuda.get_device_capability][]."""
+        """Stateless version of [torch.cuda.get_device_capability][].
+
+        Args:
+            device_id: Device index in the visible device namespace, matching
+                the argument accepted by torch.cuda.
+        """
         return None
 
     @classmethod
@@ -597,7 +612,6 @@ class Platform:
         For hybrid models, also aligns block_size with mamba page sizes.
         """
         from vllm.config.cache import CacheConfig
-        from vllm.config.vllm import set_current_vllm_config
 
         cache_config = vllm_config.cache_config
         model_config = vllm_config.model_config
@@ -612,10 +626,9 @@ class Platform:
 
         # Phase 1: Pick block size from backend (skip if user set --block-size)
         if not cache_config.user_specified_block_size:
-            with set_current_vllm_config(vllm_config):
-                preferred = backend_cls.get_preferred_block_size(
-                    CacheConfig.DEFAULT_BLOCK_SIZE
-                )
+            preferred = backend_cls.get_preferred_block_size_for_config(
+                CacheConfig.DEFAULT_BLOCK_SIZE, vllm_config
+            )
             if preferred != CacheConfig.DEFAULT_BLOCK_SIZE:
                 logger.info(
                     "Setting kv cache block size to %d for %s backend.",
@@ -865,6 +878,12 @@ class Platform:
                 ),
                 cache_config.block_size,
             )
+            if model_config.use_mla:
+                # TRTLLM/FlashInfer MLA decode kernels require the physical
+                # number of kernel blocks to be aligned to 128 / kernel_block_size.
+                # For hybrid MLA/Mamba models, make the manager block size a
+                # multiple of 128 so split kernel blocks keep that invariant.
+                kernel_block_alignment_size = max(kernel_block_alignment_size, 128)
 
         if cache_config.mamba_cache_mode == "all":
             # With prefix caching, align to mamba chunk size for kernel perf
@@ -976,7 +995,8 @@ class Platform:
             # Pinned memory support under WSL depends on the vendor and driver
             # version. Conservative default: return False. Platform subclasses
             # that can verify support (e.g. CudaPlatformBase) override this.
-            logger.warning_once(
+            # warning_once() causes a circular import on WSL, see #48397.
+            logger.warning(
                 "Using 'pin_memory=False' as WSL is detected. "
                 "This may slow down performance."
             )
@@ -1177,6 +1197,23 @@ class Platform:
         Returns if the graph mode is supported by the current platform.
         """
         return False
+
+    @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        """
+        Check whether the platform's ModelRunner can handle multiple attention
+        layers that share the same layer index (e.g. cross attention and self
+        attention in the same decoder block of an encoder-decoder model such as
+        BART).
+
+        Platforms that have verified that their ``runner_kv_caches`` is not
+        impacted by this case should override this to a no-op. Otherwise the
+        default implementation raises ``NotImplementedError``.
+        """
+        raise NotImplementedError(
+            "Multiple attention layers with the same layer index are not "
+            "supported on the current platform."
+        )
 
     @classmethod
     def support_deep_gemm(cls) -> bool:
